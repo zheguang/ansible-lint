@@ -25,10 +25,11 @@ from ansible.parsing.yaml.constructor import AnsibleMapping
 from ansible.plugins.loader import add_all_plugin_dirs
 from ansible_compat.runtime import AnsibleWarning
 
+import ansiblelint._internal
 import ansiblelint.skip_utils
 import ansiblelint.utils
 from ansiblelint.app import App, get_app
-from ansiblelint.constants import States
+from ansiblelint.constants import ANNOTATION_KEYS, States
 from ansiblelint.errors import LintWarning, MatchError, WarnSource
 from ansiblelint.file_utils import Lintable, expand_dirs_in_lintables
 from ansiblelint.logger import timed_info
@@ -37,6 +38,7 @@ from ansiblelint.text import strip_ansi_escape
 from ansiblelint.utils import (
     PLAYBOOK_DIR,
     HandleChildren,
+    Task,
     parse_examples_from_plugin,
     template,
 )
@@ -59,6 +61,17 @@ class LintResult:
     matches: list[MatchError]
     files: set[Lintable]
 
+class NoLogSecretTaskRule(ansiblelint._internal.rules.BaseRule):
+    """Secrets should not be logged."""
+
+    id = "no-log-secret-task"
+    description = (
+        "When performing a task involing secrets you should have no_log configured "
+        "to a non False value to avoid accidental leaking of secrets."
+    )
+    severity = "LOW"
+    tags = ["instaclustr"]
+    version_added = "instaclustr"
 
 class Runner:
     """Runner class performs the linting process."""
@@ -282,6 +295,141 @@ class Runner:
                 matches.extend(
                     self.rules.run(file, tags=set(self.tags), skip_list=self.skip_list),
                 )
+
+        # -- phase 3 ---
+        # Pass 1: collect secret-holding variables
+        def extract_secret_var_in(data: list[dict], is_secret: Callable[[str], bool], prefix: list[str], more_secret_vars: list[list[str]]) -> None:
+                if isinstance(data, list):
+                    for d in data:
+                        extract_secret_var_in(d, is_secret, prefix, more_secret_vars)
+                elif isinstance(data, dict):
+                    for key, val in data.items():
+                        if str(key) in ANNOTATION_KEYS:
+                            continue
+                        # if "credstash" in str(val):
+                        if is_secret(str(val)):
+                            # secret_vars.append(key)
+                            extract_secret_var_in(val, is_secret, [*prefix, key], more_secret_vars)
+                else:
+                    if prefix:
+                        more_secret_vars.append(prefix)
+
+        secret_vars: list[list[str]] = []
+        for file in self.lintables:
+            if file in self.checked_files or str(file.base_kind) != "text/yaml":
+                continue
+            if file.kind in ["handlers", "tasks", "playbook"]:
+                continue
+            #  vars
+            yaml = file.data
+            if not yaml or isinstance(yaml, str):
+                continue
+            if isinstance(yaml, dict):
+                yaml = [yaml]
+            extract_secret_var_in(yaml, lambda x: "credstash" in x, prefix = [], more_secret_vars = secret_vars)
+
+        # Pass 2..N: check dependent secret-holding variables
+        done = False
+        current_secret_vars = secret_vars
+        while not done:
+            done = True
+            more_secret_vars: list[list[str]] = []
+            for file in self.lintables:
+                if file in self.checked_files or str(file.base_kind) != "text/yaml":
+                    continue
+                if file.kind in ["handlers", "tasks", "playbook"]:
+                    continue
+                #  vars
+                yaml = file.data
+                if not yaml or isinstance(yaml, str):
+                    continue
+                if isinstance(yaml, dict):
+                    yaml = [yaml]
+
+                def refers_secret_var(x: str) -> bool:
+                    return any(".".join(sv) in x and "credstash" not in x for sv in current_secret_vars)
+
+                extract_secret_var_in(yaml, refers_secret_var, prefix = [], more_secret_vars = more_secret_vars)
+            if more_secret_vars:
+                secret_vars.extend(more_secret_vars)
+                current_secret_vars = more_secret_vars
+                done = False
+
+        _logger.debug(secret_vars)
+
+        # Pass N+1: check secret-holding tasks
+        secret_tasks: list[Task] = []
+        secret_files: list[Lintable] = []
+        for file in self.lintables:
+            if file in self.checked_files or str(file.base_kind) != "text/yaml":
+                continue
+            if file.kind not in ["handlers", "tasks", "playbook"]:
+                continue
+            for task in ansiblelint.utils.task_in_list(
+                data=file.data,
+                kind=file.kind,
+                file=file,
+            ):
+                if task.error is not None:
+                    continue
+                if "action" not in task.normalized_task:
+                    continue
+                if any(".".join(sv) in str(v) for v in task.args.values() for sv in secret_vars):
+                    secret_tasks.append(task)
+                    secret_files.append(file)
+
+        # Pass N+2..M: check dependent secret-holding tasks
+        done = False
+        current_secret_tasks = secret_tasks
+        while not done:
+            done = True
+            more_secret_tasks = []
+            current_secret_registered_tasks = [t for t in current_secret_tasks if "register" in t.raw_task]
+            current_secret_tasks_names = {t.name for t in current_secret_tasks}
+            for file in self.lintables:
+                if file in self.checked_files or str(file.base_kind) != "text/yaml":
+                    continue
+                if file.kind not in ["handlers", "tasks", "playbook"]:
+                    continue
+                for task in ansiblelint.utils.task_in_list(
+                    data=file.data,
+                    kind=file.kind,
+                    file=file,
+                ):
+                    if task.error is not None:
+                        continue
+                    if "action" not in task.normalized_task:
+                        continue
+                    if task.name in current_secret_tasks_names:
+                        continue
+                    if any(t["register"] in str(v) for v in task.args.values() for t in current_secret_registered_tasks):
+                        more_secret_tasks.append(task)
+                        secret_files.append(file)
+            if more_secret_tasks:
+                secret_tasks.extend(more_secret_tasks)
+                current_secret_tasks = more_secret_tasks
+                done = False
+
+        _logger.debug(secret_tasks)
+
+        # check no_log
+        secret_tasks_with_log = [(t, f) for t, f in zip(secret_tasks, secret_files, strict=True) if not t.get("no_log")]
+        _logger.debug(secret_tasks_with_log)
+
+        rule = NoLogSecretTaskRule()
+        self.rules.register(rule)
+        matches.extend([
+            MatchError(
+                message=t[0].name,
+                lineno=t[0].raw_task["__line__"],
+                details="",
+                lintable=t[1],
+                rule=rule,
+                tag="",
+                transform_meta=None,
+            ) for t in secret_tasks_with_log
+        ])
+        # end of phase 3
 
         # update list of checked files
         self.checked_files.update(self.lintables)
