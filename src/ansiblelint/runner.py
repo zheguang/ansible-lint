@@ -298,7 +298,7 @@ class Runner:
 
         # -- phase 3 ---
         # Pass 1: collect secret-holding variables
-        def extract_secret_var_in(data: list[dict], is_secret: Callable[[str], bool], prefix: list[str], more_secret_vars: list[list[str]]) -> None:
+        def extract_secret_var_in(data: Any, is_secret: Callable[[str], bool], prefix: list[str], more_secret_vars: list[list[str]]) -> None:
                 if isinstance(data, list):
                     for d in data:
                         extract_secret_var_in(d, is_secret, prefix, more_secret_vars)
@@ -374,6 +374,9 @@ class Runner:
                     continue
                 if "action" not in task.normalized_task:
                     continue
+                # Only check tasks with shell/command for direct secret_var reference
+                if task.action not in ("shell", "command"):
+                    continue
                 if any(".".join(sv) in str(v) for v in task.args.values() for sv in secret_vars):
                     secret_tasks.append(task)
                     secret_files.append(file)
@@ -425,7 +428,7 @@ class Runner:
                 details="",
                 lintable=t[1],
                 rule=rule,
-                tag="",
+                tag=rule.id,
                 transform_meta=None,
             ) for t in secret_tasks_with_log
         ])
